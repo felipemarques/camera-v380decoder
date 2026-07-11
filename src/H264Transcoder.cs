@@ -60,6 +60,8 @@ namespace V380Decoder.src
                     RedirectStandardError = true,
                     CreateNoWindow = true
                 };
+                // Ensure ffmpeg is found in PATH
+                psi.EnvironmentVariables["PATH"] = "/usr/local/bin:/usr/bin:/bin";
 
                 process = Process.Start(psi);
                 if (process == null)

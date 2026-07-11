@@ -100,7 +100,7 @@ if (args.Length > 0)
         rtsp.Start();
 
         webServer = new WebServer(httpPort, rtspPort, client, enableApi, enableOnvif);
-        webServer.Start();
+        await webServer.Start();
     }
 
     var cts = new CancellationTokenSource();

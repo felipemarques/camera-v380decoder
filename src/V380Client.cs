@@ -1,3 +1,4 @@
+using System.IO;
 using System.Net.Sockets;
 using System.Security.Cryptography;
 using System.Text;
@@ -21,6 +22,8 @@ namespace V380Decoder.src
         private int frameWidth = 1280;
         private int frameheight = 720;
         private byte[] aesKey = new byte[16];
+        private StreamWriter? frameDump;
+        private bool frameDumpEnabled = false;
         private bool needReconnect = false;
 
         public V380Client(string ip, int port, uint deviceId, string username, string password, SourceStream source, OutputMode mode, int streamQuality)
@@ -39,7 +42,19 @@ namespace V380Decoder.src
 
         public void Run(RtspServer rtsp, CancellationToken ct)
         {
-            while (!ct.IsCancellationRequested)
+         try
+         {
+          frameDumpEnabled = File.Exists("/home/favour/camera/frame_dump.bin");
+          if (frameDumpEnabled)
+          {
+           frameDump = new StreamWriter(new FileStream("/home/favour/camera/frame_dump.log", FileMode.Append, FileAccess.Write, FileShare.Read));
+           frameDump.AutoFlush = true;
+           LogUtils.debug("[DUMP] frame dump ENABLED - writing to /home/favour/camera/frame_dump.bin and .log");
+          }
+         }
+         catch { }
+
+         while (!ct.IsCancellationRequested)
             {
                 try
                 {
@@ -140,7 +155,7 @@ namespace V380Decoder.src
                     return 0;
                 }
                 uint loginResult = ReadUInt32LE(resp, 4);
-                if (loginResult != 1001)
+                if (loginResult != 1001 && loginResult != 1002)
                 {
                     if (loginResult == 1011)
                         Console.Error.WriteLine($"[AUTH] invalid username. exiting...");
@@ -397,20 +412,29 @@ namespace V380Decoder.src
 
                     if (!HandleAsMediaFrame(frameStartType, full, needDecrypt, mode, rtsp, stdout))
                     {
-                        Console.Error.WriteLine($"[FRAME] unknown type=0x{frameStartType:X2} len={full.Length}");
+                        Console.Error.WriteLine($"[FRAME] unknown type=0x{frameStartType:X2} len={full.Length} head={BitConverter.ToString(full, 0, Math.Min(32, full.Length))}");
                     }
                 }
             }
             catch (OperationCanceledException)
             {
-                Console.Error.WriteLine("[RECV] Operation cancelled");
+             Console.Error.WriteLine("[RECV] Operation cancelled");
+             frameDump?.WriteLine($"[{DateTime.Now:HH:mm:ss}] Operation cancelled");
+             frameDump?.Flush();
             }
             catch (Exception ex)
             {
-                Console.Error.WriteLine($"[RECV] {ex.Message}");
-                Console.Error.WriteLine($"[RECV] {ex.StackTrace}");
+             Console.Error.WriteLine($"[RECV] {ex.Message}");
+             Console.Error.WriteLine($"[RECV] {ex.StackTrace}");
+             frameDump?.WriteLine($"[{DateTime.Now:HH:mm:ss}] ERROR: {ex.Message}");
+             frameDump?.Flush();
             }
-        }
+            finally
+            {
+             // Don't dispose frameDump here - it's reused across reconnects
+             // frameDump?.Dispose();
+            }
+            }
 
         private bool HandleAsMediaFrame(byte rawType, byte[] full, bool needDecrypt, OutputMode mode, RtspServer rtsp, Stream stdout)
         {
@@ -488,6 +512,64 @@ namespace V380Decoder.src
                 return true;
             }
 
+            if (rawType == 0x18 || rawType == 0x28 || rawType == 0x29 || rawType == 0x5C)
+                        {
+                         const int headerSize = 16;
+                         if (full.Length <= headerSize) return false;
+                         byte[] payload = new byte[full.Length - headerSize];
+                         Array.Copy(full, headerSize, payload, 0, payload.Length);
+
+                         // dump raw frame before decryption
+                         if (frameDumpEnabled)
+                         {
+                          frameDump?.WriteLine($"[{DateTime.Now:HH:mm:ss.fff}] V rawType=0x{rawType:X2} len={full.Length} raw_head={BitConverter.ToString(full, 0, Math.Min(32, full.Length))}");
+                          frameDump?.Flush();
+                          var binPath = "/home/favour/camera/frame_dump.bin";
+                          using var bfs = new FileStream(binPath, FileMode.Append, FileAccess.Write, FileShare.Read);
+                          bfs.Write(full, 0, full.Length);
+                         }
+
+                         if (needDecrypt && payload.Length >= 16)
+                         {
+                          DecryptVideoFrame(payload, payload.Length);
+                         }
+
+                         // dump payload after decryption
+                         if (frameDumpEnabled)
+                         {
+                          frameDump?.WriteLine($"  -> decrypted len={payload.Length} head={BitConverter.ToString(payload, 0, Math.Min(64, payload.Length))}");
+                          frameDump?.Flush();
+                          var binPath = "/home/favour/camera/frame_dump.bin";
+                          using var bfs = new FileStream(binPath, FileMode.Append, FileAccess.Write, FileShare.Read);
+                          bfs.Write(payload, 0, payload.Length);
+                         }
+
+                         bool keyFrame = IsKeyVideoFrame(rawType, outerFrameType, payload);
+                         if (mode == OutputMode.Rtsp)
+                         {
+                          snapshotManager.UpdateFrame(payload, frameWidth, frameheight, keyFrame, outerTimestamp);
+                         }
+                         var vFrame = new FrameData
+                         {
+                          RawType = rawType,
+                          FrameId = outerFrameId,
+                          FrameType = outerFrameType,
+                          FrameRate = outerFrameRate,
+                          Timestamp = outerTimestamp,
+                          Codec = VideoCodec.H265,
+                          Payload = payload
+                         };
+                         if (mode == OutputMode.Video)
+                         {
+                          stdout?.Write(payload, 0, payload.Length);
+                          stdout?.Flush();
+                         }
+                         else if (mode == OutputMode.Rtsp)
+                         {
+                          rtsp?.PushVideo(vFrame);
+                         }
+                         return true;
+                        }
             if (!TryExtractVideoPayload(full, needDecrypt, out var normalizedPayload))
             {
                 LogUtils.debug($"[FRAME] unclassified type=0x{rawType:X2} len={full.Length} head={BitConverter.ToString(full, 0, Math.Min(16, full.Length))}");
@@ -625,7 +707,7 @@ namespace V380Decoder.src
 
         private bool IsKeyVideoFrame(byte rawType, ushort frameType, byte[] payload)
         {
-            if (rawType == 0x00) return true;
+            if (rawType == 0x00 || rawType == 0x5C) return true;
 
             int nalOffset = payload.Length >= 4 && payload[2] == 0 && payload[3] == 1 ? 4 : 3;
             if (payload.Length <= nalOffset) return false;
