@@ -58,6 +58,21 @@ This project is based on reverse engineering of the V380 protocol and is a C#/.N
 - Firmware version: `Hw_HsXMQQFC_WF_QQ_20240806`
 - Notes: reported by user and added as an additional known-working/newer device reference for this project
 
+### Camera D
+
+- Software version: `AppEV3L_V2_V1.0.4.1_20241029`
+- Firmware version: `Hw_HsAkQQVL_WF_QQ_20240412`
+- Notes: dual-cam (2-lens PTZ) setup, confirmed working for both video and audio on
+  two units of this camera model simultaneously. Reference product image below.
+  Audio codec on this model is IMA-ADPCM (auto-detected via `audioBits==16` from the
+  login handshake); Cameras A/B/C use classic 8-bit G.711 audio and are handled by the
+  original code path, untouched by the ADPCM-specific fixes below.
+- **Disclaimer**: support for this camera (video/audio decode fixes, protocol
+  corrections, and performance tuning) was added with AI assistance. Review the
+  relevant changes before relying on this in a security-critical deployment.
+
+![Tested dual-lens camera](demo/tested-camera-dual-lens.jpg)
+
 ## Quick Start With Docker
 
 Build the image:
@@ -315,6 +330,12 @@ WantedBy=multi-user.target
 
 ## Acknowledgements
 
-- [prsyahmi/v380](https://github.com/prsyahmi/v380) for the original reverse engineering work
-- [Cyberlink Security](https://cyberlinksecurity.ie/vulnerabilities-to-exploit-a-chinese-ip-camera/) for protocol and vulnerability research around V380 devices
-- Tooling used in the broader reverse engineering workflow: Wireshark, PacketSender, JADX, Ghidra, and Frida
+| Source | Contribution |
+|---|---|
+| [felipemarques/camera-v380decoder](https://github.com/felipemarques/camera-v380decoder) | The repo this project is maintained as/cloned from |
+| [PyanSofyan/V380Decoder](https://github.com/PyanSofyan/V380Decoder) | The C#/.NET codebase this fork descends from, extended for newer/3-lens H.265 cameras |
+| [prsyahmi/v380](https://github.com/prsyahmi/v380) | Original V380 protocol reverse engineering (video/H.264 extraction) |
+| [jericjan/v380-audio-player](https://github.com/jericjan/v380-audio-player) | Reference used to identify the real V380 audio codec (IMA-ADPCM, not G.711 A-law) |
+| [acida/pyima](https://github.com/acida/pyima) | Original IMA-ADPCM encoder/decoder that the audio fix is ported from |
+| [Cyberlink Security](https://cyberlinksecurity.ie/vulnerabilities-to-exploit-a-chinese-ip-camera/) | Protocol and vulnerability research around V380 devices |
+| Wireshark, PacketSender, JADX, Ghidra, Frida | Tooling used in the broader reverse engineering workflow |

@@ -20,7 +20,7 @@ namespace V380Decoder.src
         private ushort audioSeq;
         private uint videoSsrc = (uint)new Random().Next();
         private uint audioSsrc = (uint)new Random().Next();
-        private uint generatedVideoTimestamp;
+        private long videoStartTicks;
 
         public event Action OnClose;
 
@@ -156,24 +156,34 @@ namespace V380Decoder.src
         {
             if (!playing) return;
 
-            uint rts = f.Timestamp > 0
-                ? (uint)(f.Timestamp * 90)
-                : (generatedVideoTimestamp += 3600);
+            // f.Timestamp is the camera's raw device clock (a large, arbitrary-origin
+            // value, not milliseconds-since-stream-start), so f.Timestamp*90 produces
+            // wild jumps into the billions and clients reject/DTS-discontinuity-abort
+            // the stream. Use real elapsed wall-clock time since this session started
+            // playing instead - matches how PCM/RTP clocks are supposed to behave.
+            if (videoStartTicks == 0) videoStartTicks = Environment.TickCount64;
+            uint rts = (uint)((Environment.TickCount64 - videoStartTicks) * 90);
 
             RtspServer.ParseNals(f.Payload, VideoCodec.H264, (nalType, nal) =>
             {
                 const int mtu = 1400;
+                // Per RFC 6184, the marker bit must be set only on the last packet
+                // of an access unit (the actual VCL slice), not on every NAL. Setting
+                // it on AUD/SPS/PPS too makes receivers treat each as its own access
+                // unit, corrupting frame boundary detection downstream.
+                bool isLastNalOfAccessUnit = nalType is 1 or 5;
+
                 if (nal.Length <= mtu)
                 {
-                    SendRtp(videoCh, 96, videoSeq++, rts, videoSsrc, nal, 0, nal.Length, marker: true);
+                    SendRtp(videoCh, 96, videoSeq++, rts, videoSsrc, nal, 0, nal.Length, marker: isLastNalOfAccessUnit);
                     return;
                 }
 
-                SendH264Fragmented(nal, rts, mtu);
+                SendH264Fragmented(nal, rts, mtu, isLastNalOfAccessUnit);
             });
         }
 
-        void SendH264Fragmented(byte[] nal, uint rts, int mtu)
+        void SendH264Fragmented(byte[] nal, uint rts, int mtu, bool isLastNalOfAccessUnit)
         {
             byte nalHdr = nal[0];
             byte fuInd = (byte)((nalHdr & 0xE0) | 28);
@@ -194,7 +204,7 @@ namespace V380Decoder.src
                 frag[1] = fuHdr;
                 Array.Copy(nal, offset, frag, 2, chunk);
 
-                SendRtp(videoCh, 96, videoSeq++, rts, videoSsrc, frag, 0, frag.Length, marker: last);
+                SendRtp(videoCh, 96, videoSeq++, rts, videoSsrc, frag, 0, frag.Length, marker: last && isLastNalOfAccessUnit);
                 offset += chunk;
                 first = false;
             }

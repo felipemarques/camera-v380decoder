@@ -20,8 +20,10 @@ namespace V380Decoder.src
         private ushort deviceVersion, communicationVersion;
         private int frameWidth = 1280;
         private int frameheight = 720;
+        private int audioBits = 8;
         private byte[] aesKey = new byte[16];
         private bool needReconnect = false;
+        private double audioClockMs = 0;
 
         public V380Client(string ip, int port, uint deviceId, string username, string password, SourceStream source, OutputMode mode, int streamQuality)
         {
@@ -282,6 +284,7 @@ namespace V380Decoder.src
                 communicationVersion = version;
                 frameWidth = (int)width;
                 frameheight = (int)height;
+                this.audioBits = audioBits;
                 LogUtils.debug($"[STREAM] login result: {result}");
                 LogUtils.debug($"[STREAM] login version: {version}");
                 LogUtils.debug($"[STREAM] login width: {width}");
@@ -474,13 +477,20 @@ namespace V380Decoder.src
                 }
                 else if (mode == OutputMode.Rtsp)
                 {
+                    // PCMA/8000/1: 1 byte == 1 sample == 1/8 ms. Timestamp must keep
+                    // increasing across frames, otherwise RTP ts resets to 0 every
+                    // frame and downstream players (ffmpeg/browser) drop the stream
+                    // as non-monotonic after the first packet.
+                    ulong ts = (ulong)audioClockMs;
+                    audioClockMs += audioPayload.Length / 8.0;
+
                     rtsp?.PushAudio(new FrameData
                     {
                         RawType = rawType,
                         FrameId = 0,
                         FrameType = 0,
                         FrameRate = 0,
-                        Timestamp = 0,
+                        Timestamp = ts,
                         Payload = audioPayload
                     });
                 }
@@ -527,12 +537,20 @@ namespace V380Decoder.src
 
         private byte[] ExtractAudioPayload(byte[] full, bool needDecrypt)
         {
+            // audioBits==16 (from the login handshake) identifies the newer devices
+            // whose outer per-packet header is 16 bytes, followed by a 256-byte
+            // IMA-ADPCM block (4-byte block header + 252 bytes of packed nibbles =
+            // 505 samples) - confirmed against github.com/jericjan/v380-audio-player
+            // (pyima.py). Older 8-bit G.711 devices (audioBits==8, e.g. Cameras A/B/C
+            // in the README) keep the original 20-byte header offset untouched, so
+            // this fix doesn't risk misaligning their audio.
+            int headerLen = audioBits == 16 ? 16 : 20;
             byte[] payload;
 
-            if (full.Length > 20)
+            if (full.Length > headerLen)
             {
-                payload = new byte[full.Length - 20];
-                Array.Copy(full, 20, payload, 0, payload.Length);
+                payload = new byte[full.Length - headerLen];
+                Array.Copy(full, headerLen, payload, 0, payload.Length);
             }
             else
             {
@@ -547,7 +565,116 @@ namespace V380Decoder.src
                     DecryptAudioFrame(payload, payload.Length);
             }
 
+            // The RTSP SDP always advertises PCMA/8000/1 (G.711 A-law, 8 bits/sample).
+            // This device's audio is actually IMA-ADPCM (audioBits==16 from the login
+            // handshake reflects the ADPCM predictor width, not raw PCM sample width).
+            // Decode the ADPCM block to linear PCM, then encode to real A-law so the
+            // rest of the pipeline (SDP, go2rtc, Frigate) needs no changes.
+            if (audioBits == 16 && payload.Length == 256)
+            {
+                short[] pcm = DecodeImaAdpcmBlock(payload);
+                var outBytes = new byte[pcm.Length];
+                for (int i = 0; i < pcm.Length; i++)
+                    outBytes[i] = LinearToALaw(pcm[i]);
+                payload = outBytes;
+            }
+
             return payload;
+        }
+
+        private static readonly int[] ImaIndexTable =
+        {
+            -1, -1, -1, -1, 2, 4, 6, 8,
+            -1, -1, -1, -1, 2, 4, 6, 8
+        };
+
+        private static readonly int[] ImaStepTable =
+        {
+            7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 19, 21, 23, 25, 28, 31,
+            34, 37, 41, 45, 50, 55, 60, 66, 73, 80, 88, 97, 107, 118, 130, 143,
+            157, 173, 190, 209, 230, 253, 279, 307, 337, 371, 408, 449, 494, 544, 598, 658,
+            724, 796, 876, 963, 1060, 1166, 1282, 1411, 1552, 1707, 1878, 2066, 2272, 2499, 2749, 3024,
+            3327, 3660, 4026, 4428, 4871, 5358, 5894, 6484, 7132, 7845, 8630, 9493, 10442, 11487, 12635, 13899,
+            15289, 16818, 18500, 20350, 22385, 24623, 27086, 29794, 32767
+        };
+
+        // Decodes one 256-byte IMA-ADPCM block: 2-byte initial predictor (LE),
+        // 1-byte initial step index, 1-byte reserved, then 252 bytes of nibbles
+        // (low nibble first, high nibble second) -> 505 16-bit PCM samples.
+        private static short[] DecodeImaAdpcmBlock(byte[] block)
+        {
+            var samples = new short[505];
+            int predicted = (short)(block[0] | (block[1] << 8));
+            int index = Math.Clamp((int)block[2], 0, 88);
+            int step = ImaStepTable[index];
+            samples[0] = (short)predicted;
+
+            int outPos = 1;
+            for (int i = 4; i < block.Length; i++)
+            {
+                int b = block[i];
+                int first = b & 0xF;
+                int second = b >> 4;
+
+                predicted = DecodeImaNibble(first, ref index, ref step, predicted);
+                samples[outPos++] = (short)predicted;
+                predicted = DecodeImaNibble(second, ref index, ref step, predicted);
+                samples[outPos++] = (short)predicted;
+            }
+
+            return samples;
+        }
+
+        private static int DecodeImaNibble(int nibble, ref int index, ref int step, int predicted)
+        {
+            int diff = step >> 3;
+            if ((nibble & 4) != 0) diff += step;
+            if ((nibble & 2) != 0) diff += step >> 1;
+            if ((nibble & 1) != 0) diff += step >> 2;
+
+            predicted += (nibble & 8) != 0 ? -diff : diff;
+            predicted = Math.Clamp(predicted, -32767, 32767);
+
+            index += ImaIndexTable[nibble];
+            index = Math.Clamp(index, 0, 88);
+            step = ImaStepTable[index];
+
+            return predicted;
+        }
+
+        private static readonly short[] AlawSegEnd = { 0x1F, 0x3F, 0x7F, 0xFF, 0x1FF, 0x3FF, 0x7FF, 0xFFF };
+
+        private static int AlawSearch(int val, short[] table)
+        {
+            for (int i = 0; i < table.Length; i++)
+                if (val <= table[i]) return i;
+            return table.Length;
+        }
+
+        // Standard ITU-T G.711 linear-to-A-law encoder.
+        private static byte LinearToALaw(short pcmVal)
+        {
+            int mask;
+            int val = pcmVal >> 3;
+
+            if (val >= 0)
+            {
+                mask = 0xD5;
+            }
+            else
+            {
+                mask = 0x55;
+                val = -val - 1;
+            }
+
+            int seg = AlawSearch(val, AlawSegEnd);
+
+            if (seg >= 8)
+                return (byte)(0x7F ^ mask);
+
+            byte aval = (byte)(seg << 4);
+            aval |= (byte)(seg < 2 ? (val >> 1) & 0xF : (val >> seg) & 0xF);
+            return (byte)(aval ^ mask);
         }
 
         private bool TryExtractVideoPayload(byte[] full, bool needDecrypt, out byte[] normalizedPayload)
@@ -580,25 +707,28 @@ namespace V380Decoder.src
 
         private IEnumerable<byte[]> EnumerateVideoCandidates(byte[] full, bool needDecrypt)
         {
-            foreach (int offset in new[] { 0, 4, 8, 12, 16, 20 })
+            // The outer per-frame header is always 16 bytes (frameId:4, frameType:2,
+            // frameRate:2, timestamp:8 - the same fields HandleAsMediaFrame already
+            // reads as outerFrameId/outerFrameType/outerFrameRate/outerTimestamp).
+            // Confirmed against the audio path (IMA-ADPCM block starts at byte 16),
+            // so there's no need to brute-force multiple offsets here.
+            const int offset = 16;
+            if (full.Length <= offset) yield break;
+
+            byte[] direct = new byte[full.Length - offset];
+            Array.Copy(full, offset, direct, 0, direct.Length);
+
+            if (needDecrypt && direct.Length >= 16)
             {
-                if (full.Length <= offset) continue;
-
-                byte[] direct = new byte[full.Length - offset];
-                Array.Copy(full, offset, direct, 0, direct.Length);
-
-                if (needDecrypt && direct.Length >= 16)
-                {
-                    byte[] decrypted = (byte[])direct.Clone();
-                    if (communicationVersion == 21)
-                        DecryptMediaPre2k(decrypted, decrypted.Length, 1);
-                    else
-                        DecryptVideoFrame(decrypted, decrypted.Length);
-                    yield return decrypted;
-                }
-
-                yield return direct;
+                byte[] decrypted = (byte[])direct.Clone();
+                if (communicationVersion == 21)
+                    DecryptMediaPre2k(decrypted, decrypted.Length, 1);
+                else
+                    DecryptVideoFrame(decrypted, decrypted.Length);
+                yield return decrypted;
             }
+
+            yield return direct;
         }
 
         private bool TryNormalizeVideoPayload(byte[] payload, out byte[] normalizedPayload)
@@ -744,14 +874,34 @@ namespace V380Decoder.src
             int offset = payload[2] == 1 ? 3 : 4;
             if (payload.Length <= offset) return VideoCodec.Unknown;
 
+            // H264 nal_unit_type (lower 5 bits) and H265 nal_unit_type (bits 1-6)
+            // are different slices of the *same* header byte, so a plain range check
+            // is ambiguous: many real H265 headers coincidentally satisfy the "valid
+            // H264 type" range too, and vice versa. Resolve this in stages, from most
+            // to least specific, so older 8-bit-audio/H264-only devices (Cameras A/B/C)
+            // keep matching exactly as before while newer H265 3-lens devices (Camera D)
+            // are also detected correctly:
+            //
+            //   1. Actual H264 VCL slice types (1 or 5) are checked first and are
+            //      effectively unambiguous - real HEVC VCL headers essentially never
+            //      produce these two specific values under the H264 5-bit reading, so
+            //      this cannot regress older H264 devices.
+            //   2. H265's type range next, to catch real H265 streams that would
+            //      otherwise be misclassified as H264 by the broad range in step 3.
+            //   3. The original broad H264 range (parameter sets, SEI, AUD, etc.) as a
+            //      last resort, matching original pre-fix behavior for anything not
+            //      already resolved above.
             byte nalHeader = payload[offset];
             int h264NalType = nalHeader & 0x1F;
-            if (h264NalType is > 0 and < 24)
+            if (h264NalType is 1 or 5)
                 return VideoCodec.H264;
 
             int h265NalType = (nalHeader >> 1) & 0x3F;
             if (h265NalType is > 0 and < 48)
                 return VideoCodec.H265;
+
+            if (h264NalType is > 0 and < 24)
+                return VideoCodec.H264;
 
             return VideoCodec.Unknown;
         }

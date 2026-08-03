@@ -32,6 +32,7 @@ if (args.Length > 0)
     int rtspPort = ArgParser.GetArg(args, "--rtsp-port", 8554);
     int httpPort = ArgParser.GetArg(args, "--http-port", 8080);
     bool debug = ArgParser.GetArg(args, "--debug", false);
+    bool noVideo = ArgParser.GetArg(args, "--no-video", false);
 
     if (source.Equals("lan", StringComparison.OrdinalIgnoreCase) && string.IsNullOrEmpty(ip))
     {
@@ -96,7 +97,7 @@ if (args.Length > 0)
     WebServer webServer = null;
     if (outputMode == OutputMode.Rtsp)
     {
-        rtsp = new(rtspPort);
+        rtsp = new(rtspPort, enableVideoTranscode: !noVideo);
         rtsp.Start();
 
         webServer = new WebServer(httpPort, rtspPort, client, enableApi, enableOnvif);
@@ -212,6 +213,9 @@ SERVER OPTIONS:
 OTHER OPTIONS:
   --discover             Find camera devices on the local network
   --debug                Enable debug logging (default: false)
+  --no-video              Skip the HEVC->H264 transcoder entirely (rtsp mode only).
+                         Use when this instance is only ever consumed for its
+                         audio track, to avoid wasting CPU on an unused encode.
   --help                 Show this help message
 
 EXAMPLES:

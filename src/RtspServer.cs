@@ -19,10 +19,15 @@ namespace V380Decoder.src
         private byte[] cachedPps;
         private readonly object sdpLock = new();
 
-        public RtspServer(int port)
+        public RtspServer(int port, bool enableVideoTranscode = true)
         {
             this.port = port;
-            transcoder = new H264Transcoder(PushVideoDirect);
+            // The HEVC->H264 transcode (libx264) is the expensive part of this whole
+            // process. When this instance is only ever consumed for its audio track
+            // (e.g. go2rtc pulling "#audio=aac" while video comes from the camera's
+            // own native RTSP instead), running it is pure wasted CPU - skip it.
+            if (enableVideoTranscode)
+                transcoder = new H264Transcoder(PushVideoDirect);
         }
 
         public void Start()
@@ -55,6 +60,8 @@ namespace V380Decoder.src
 
         public void PushVideo(FrameData f)
         {
+            if (transcoder == null) return; // video output disabled - audio-only instance
+
             if (f.Codec == VideoCodec.H265 && transcoder.IsAvailable)
             {
                 transcoder.PushFrame(f);
@@ -165,7 +172,7 @@ namespace V380Decoder.src
             running = false;
             try { listener?.Stop(); } catch { }
             foreach (var s in sessions.Values) s.Close();
-            transcoder.Dispose();
+            transcoder?.Dispose();
         }
     }
 }
