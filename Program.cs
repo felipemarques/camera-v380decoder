@@ -31,6 +31,7 @@ if (args.Length > 0)
     bool enableApi = ArgParser.GetArg(args, "--enable-api", false);
     int rtspPort = ArgParser.GetArg(args, "--rtsp-port", 8554);
     int httpPort = ArgParser.GetArg(args, "--http-port", 8080);
+    string rtspCodec = ArgParser.GetArg(args, "--rtsp-codec", "native");
     bool debug = ArgParser.GetArg(args, "--debug", false);
 
     if (source.Equals("lan", StringComparison.OrdinalIgnoreCase) && string.IsNullOrEmpty(ip))
@@ -96,7 +97,7 @@ if (args.Length > 0)
     WebServer webServer = null;
     if (outputMode == OutputMode.Rtsp)
     {
-        rtsp = new(rtspPort);
+        rtsp = new(rtspPort, transcodeToH264: rtspCodec.Equals("h264", StringComparison.OrdinalIgnoreCase));
         rtsp.Start();
 
         webServer = new WebServer(httpPort, rtspPort, client, enableApi, enableOnvif);
@@ -193,6 +194,12 @@ OUTPUT OPTIONS:
 
   --rtsp-port <number>   RTSP server port when output=rtsp (default: 8554)
                          Example: --rtsp-port 8554
+
+  --rtsp-codec <mode>    RTSP video codec: 'native' or 'h264' (default: native)
+                         native - send the camera stream as is (H.264 or H.265,
+                                  RFC 6184 / RFC 7798), no transcoding
+                         h264   - transcode H.265 to H.264 with ffmpeg (CPU heavy;
+                                  only for clients that cannot play H.265)
 
   --quality <mode>       Stream quality: 'sd' or 'hd' (default: hd)
                          sd   - Lower bitrate/resolution, usually more fluid for snapshots/MJPEG

@@ -160,20 +160,26 @@ namespace V380Decoder.src
                 ? (uint)(f.Timestamp * 90)
                 : (generatedVideoTimestamp += 3600);
 
-            RtspServer.ParseNals(f.Payload, VideoCodec.H264, (nalType, nal) =>
-            {
-                const int mtu = 1400;
-                if (nal.Length <= mtu)
-                {
-                    SendRtp(videoCh, 96, videoSeq++, rts, videoSsrc, nal, 0, nal.Length, marker: true);
-                    return;
-                }
+            VideoCodec codec = f.Codec == VideoCodec.H265 ? VideoCodec.H265 : VideoCodec.H264;
+            var nals = new List<byte[]>();
+            RtspServer.ParseNals(f.Payload, codec, (_, nal) => { if (nal.Length > 0) nals.Add(nal); });
 
-                SendH264Fragmented(nal, rts, mtu);
-            });
+            const int mtu = 1400;
+            for (int i = 0; i < nals.Count; i++)
+            {
+                byte[] nal = nals[i];
+                // RTP marker = last packet of the access unit (RFC 6184 5.1 / RFC 7798 4.1).
+                bool lastNal = i == nals.Count - 1;
+                if (nal.Length <= mtu)
+                    SendRtp(videoCh, 96, videoSeq++, rts, videoSsrc, nal, 0, nal.Length, marker: lastNal);
+                else if (codec == VideoCodec.H265)
+                    SendH265Fragmented(nal, rts, mtu, lastNal);
+                else
+                    SendH264Fragmented(nal, rts, mtu, lastNal);
+            }
         }
 
-        void SendH264Fragmented(byte[] nal, uint rts, int mtu)
+        void SendH264Fragmented(byte[] nal, uint rts, int mtu, bool lastNalOfFrame)
         {
             byte nalHdr = nal[0];
             byte fuInd = (byte)((nalHdr & 0xE0) | 28);
@@ -194,7 +200,40 @@ namespace V380Decoder.src
                 frag[1] = fuHdr;
                 Array.Copy(nal, offset, frag, 2, chunk);
 
-                SendRtp(videoCh, 96, videoSeq++, rts, videoSsrc, frag, 0, frag.Length, marker: last);
+                SendRtp(videoCh, 96, videoSeq++, rts, videoSsrc, frag, 0, frag.Length, marker: last && lastNalOfFrame);
+                offset += chunk;
+                first = false;
+            }
+        }
+
+        // RFC 7798 4.4.3 Fragmentation Units: 2-byte PayloadHdr (Type = 49, F/LayerId/TID
+        // copied from the NAL header) + 1-byte FU header (S, E, FuType), then the NAL
+        // payload without its own 2-byte header.
+        void SendH265Fragmented(byte[] nal, uint rts, int mtu, bool lastNalOfFrame)
+        {
+            if (nal.Length < 3) return;
+            byte nalType = (byte)((nal[0] >> 1) & 0x3F);
+            byte ph0 = (byte)((nal[0] & 0x81) | (49 << 1));
+            byte ph1 = nal[1];
+            int offset = 2;
+            bool first = true;
+
+            while (offset < nal.Length)
+            {
+                int chunk = Math.Min(mtu - 3, nal.Length - offset);
+                bool last = offset + chunk >= nal.Length;
+
+                byte fuHdr = nalType;
+                if (first) fuHdr |= 0x80;
+                if (last) fuHdr |= 0x40;
+
+                var frag = new byte[3 + chunk];
+                frag[0] = ph0;
+                frag[1] = ph1;
+                frag[2] = fuHdr;
+                Array.Copy(nal, offset, frag, 3, chunk);
+
+                SendRtp(videoCh, 96, videoSeq++, rts, videoSsrc, frag, 0, frag.Length, marker: last && lastNalOfFrame);
                 offset += chunk;
                 first = false;
             }
