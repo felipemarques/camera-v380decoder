@@ -6,6 +6,131 @@ namespace V380Decoder.src
   {
     private static Timer ptzStopTimer;
     private static readonly object ptzLock = new();
+
+    // ------------------------------------------------------------------
+    // Optional second ONVIF profile (substream)
+    // The substream is served by a separate V380Decoder process (--quality sd);
+    // this instance announces it as Profile_2 so that NVRs can open two streams:
+    // Profile_2 (SD) for live view, Profile_1 (HD) for recording.
+    // SubRtspPort = 0: single profile (original behaviour).
+    // ------------------------------------------------------------------
+    public static int SubRtspPort = 0;
+    public static int SubWidth = 640, SubHeight = 720;
+    private static bool HasSub => SubRtspPort > 0;
+
+    private static (int w, int h) MainSize(V380Client camera)
+    {
+      int w = camera?.VideoWidth ?? 0, h = camera?.VideoHeight ?? 0;
+      return (w > 0 && h > 0) ? (w, h) : (1280, 720);
+    }
+
+    // Value of a SOAP request element (ProfileToken, ConfigurationToken...),
+    // with any namespace prefix. null if absent.
+    private static string ReqValue(string body, string tag)
+    {
+      var m = System.Text.RegularExpressions.Regex.Match(body ?? "",
+        @"<(?:[A-Za-z0-9_.-]+:)?" + tag + @"(?:\s[^>]*)?>\s*([^<\s]+)\s*</");
+      return m.Success ? m.Groups[1].Value : null;
+    }
+
+    // Only the exact substream token selects the substream; anything else = main stream (original behaviour).
+    private static bool IsSubProfile(string token) => HasSub && token == "Profile_2";
+    private static bool IsSubEncoder(string token) => HasSub && token == "VideoEnc_2";
+
+    private static string ProfileXml(string element, bool sub, V380Client camera)
+    {
+      var (mw, mh) = MainSize(camera);
+      string token = sub ? "Profile_2" : "Profile_1";
+      string name = sub ? "V380 Sub" : "V380 Live";
+      string enc = sub ? "VideoEnc_2" : "VideoEnc_1";
+      int w = sub ? SubWidth : mw, h = sub ? SubHeight : mh;
+      int br = sub ? 512 : 4096;
+      return $@"
+                <trt:{element} token=""{token}"" fixed=""true"">
+                  <tt:Name>{name}</tt:Name>
+                  <tt:VideoSourceConfiguration token=""VideoSrcCfg_1"">
+                    <tt:Name>VideoSource</tt:Name>
+                    <tt:UseCount>1</tt:UseCount>
+                    <tt:SourceToken>VideoSource_1</tt:SourceToken>
+                    <tt:Bounds x=""0"" y=""0"" width=""{mw}"" height=""{mh}""/>
+                  </tt:VideoSourceConfiguration>
+                  <tt:VideoEncoderConfiguration token=""{enc}"">
+                    <tt:Name>H264</tt:Name>
+                    <tt:UseCount>1</tt:UseCount>
+                    <tt:Encoding>H264</tt:Encoding>
+                    <tt:Resolution><tt:Width>{w}</tt:Width><tt:Height>{h}</tt:Height></tt:Resolution>
+                    <tt:RateControl>
+                      <tt:FrameRateLimit>25</tt:FrameRateLimit>
+                      <tt:EncodingInterval>1</tt:EncodingInterval>
+                      <tt:BitrateLimit>{br}</tt:BitrateLimit>
+                    </tt:RateControl>
+                    <tt:H264>
+                      <tt:GovLength>30</tt:GovLength>
+                      <tt:H264Profile>High</tt:H264Profile>
+                    </tt:H264>
+                    <tt:Multicast>
+                      <tt:Address><tt:Type>IPv4</tt:Type><tt:IPv4Address>0.0.0.0</tt:IPv4Address></tt:Address>
+                      <tt:Port>0</tt:Port><tt:TTL>0</tt:TTL><tt:AutoStart>false</tt:AutoStart>
+                    </tt:Multicast>
+                    <tt:SessionTimeout>PT60S</tt:SessionTimeout>
+                  </tt:VideoEncoderConfiguration>
+                  <tt:AudioSourceConfiguration token=""AudioSrcCfg_1"">
+                    <tt:Name>AudioSource</tt:Name>
+                    <tt:UseCount>1</tt:UseCount>
+                    <tt:SourceToken>AudioSource_1</tt:SourceToken>
+                  </tt:AudioSourceConfiguration>
+                  <tt:AudioEncoderConfiguration token=""AudioEnc_1"">
+                    <tt:Name>PCMA</tt:Name>
+                    <tt:UseCount>1</tt:UseCount>
+                    <tt:Encoding>G711</tt:Encoding>
+                    <tt:Bitrate>64</tt:Bitrate>
+                    <tt:SampleRate>8</tt:SampleRate>
+                    <tt:Multicast>
+                      <tt:Address><tt:Type>IPv4</tt:Type><tt:IPv4Address>0.0.0.0</tt:IPv4Address></tt:Address>
+                      <tt:Port>0</tt:Port><tt:TTL>0</tt:TTL><tt:AutoStart>false</tt:AutoStart>
+                    </tt:Multicast>
+                    <tt:SessionTimeout>PT60S</tt:SessionTimeout>
+                  </tt:AudioEncoderConfiguration>
+                  <tt:PTZConfiguration token=""PTZConfig_1"">
+                    <tt:Name>PTZ</tt:Name>
+                    <tt:UseCount>1</tt:UseCount>
+                    <tt:NodeToken>PTZNode_1</tt:NodeToken>
+                    <tt:DefaultContinuousPanTiltVelocitySpace>
+                      http://www.onvif.org/ver10/tptz/PanTiltSpaces/VelocityGenericSpace
+                    </tt:DefaultContinuousPanTiltVelocitySpace>
+                    <tt:DefaultPTZTimeout>PT1S</tt:DefaultPTZTimeout>
+                    <tt:PanTiltLimits>
+                      <tt:Range>
+                        <tt:URI>http://www.onvif.org/ver10/tptz/PanTiltSpaces/VelocityGenericSpace</tt:URI>
+                        <tt:XRange><tt:Min>-1</tt:Min><tt:Max>1</tt:Max></tt:XRange>
+                        <tt:YRange><tt:Min>-1</tt:Min><tt:Max>1</tt:Max></tt:YRange>
+                      </tt:Range>
+                    </tt:PanTiltLimits>
+                  </tt:PTZConfiguration>
+                </trt:{element}>";
+    }
+
+    private static string EncoderXml(string element, bool sub, V380Client camera)
+    {
+      var (mw, mh) = MainSize(camera);
+      string enc = sub ? "VideoEnc_2" : "VideoEnc_1";
+      int w = sub ? SubWidth : mw, h = sub ? SubHeight : mh;
+      int br = sub ? 512 : 4096;
+      return $@"
+                <trt:{element} token=""{enc}"">
+                  <tt:Name>H264</tt:Name>
+                  <tt:UseCount>1</tt:UseCount>
+                  <tt:Encoding>H264</tt:Encoding>
+                  <tt:Resolution><tt:Width>{w}</tt:Width><tt:Height>{h}</tt:Height></tt:Resolution>
+                  <tt:RateControl>
+                    <tt:FrameRateLimit>25</tt:FrameRateLimit>
+                    <tt:EncodingInterval>1</tt:EncodingInterval>
+                    <tt:BitrateLimit>{br}</tt:BitrateLimit>
+                  </tt:RateControl>
+                  <tt:H264><tt:GovLength>30</tt:GovLength><tt:H264Profile>High</tt:H264Profile></tt:H264>
+                  <tt:SessionTimeout>PT60S</tt:SessionTimeout>
+                </trt:{element}>";
+    }
     public static string Handle(string action, string body, HttpContext ctx, V380Client camera, int httpPort, int rtspPort)
     {
       if (Contains(action, body, "GetSystemDateAndTime")) return RespGetSystemDateAndTime();
@@ -17,14 +142,14 @@ namespace V380Decoder.src
       else if (Contains(action, body, "GetNTP")) return RespGetNTP();
       else if (Contains(action, body, "GetHostname")) return RespGetHostname();
       else if (Contains(action, body, "GetCapabilities")) return RespGetCapabilities(ctx);
-      else if (Contains(action, body, "GetProfiles")) return RespGetProfiles();
-      else if (Contains(action, body, "GetProfile")) return RespGetProfile();
-      else if (Contains(action, body, "GetVideoSources")) return RespGetVideoSources();
-      else if (Contains(action, body, "GetVideoSourceConfigurations")) return RespGetVideoSourceConfigurations();
-      else if (Contains(action, body, "GetVideoSourceConfiguration")) return RespGetVideoSourceConfig();
+      else if (Contains(action, body, "GetProfiles")) return RespGetProfiles(camera);
+      else if (Contains(action, body, "GetProfile")) return RespGetProfile(body, camera);
+      else if (Contains(action, body, "GetVideoSources")) return RespGetVideoSources(camera);
+      else if (Contains(action, body, "GetVideoSourceConfigurations")) return RespGetVideoSourceConfigurations(camera);
+      else if (Contains(action, body, "GetVideoSourceConfiguration")) return RespGetVideoSourceConfig(camera);
       else if (Contains(action, body, "GetVideoEncoderConfigurationOptions")) return RespGetVideoEncoderConfigOptions();
-      else if (Contains(action, body, "GetVideoEncoderConfigurations")) return RespGetVideoEncoderConfigurations();
-      else if (Contains(action, body, "GetVideoEncoderConfiguration")) return RespGetVideoEncoderConfig();
+      else if (Contains(action, body, "GetVideoEncoderConfigurations")) return RespGetVideoEncoderConfigurations(camera);
+      else if (Contains(action, body, "GetVideoEncoderConfiguration")) return RespGetVideoEncoderConfig(body, camera);
       else if (Contains(action, body, "GetAudioSources")) return RespGetAudioSources();
       else if (Contains(action, body, "GetAudioSourceConfigurations")) return RespGetAudioSourceConfigurations();
       else if (Contains(action, body, "GetAudioSourceConfiguration")) return RespGetAudioSourceConfig();
@@ -49,7 +174,7 @@ namespace V380Decoder.src
       else if (Contains(action, body, "GetImagingSettings")) return RespGetImagingSettings();
       else if (Contains(action, body, "GetMoveOptions")) return RespGetMoveOptions();
       else if (Contains(action, body, "GetOptions")) return RespGetImagingOptions();
-      else if (Contains(action, body, "GetStreamUri")) return RespGetStreamUri(ctx, rtspPort);
+      else if (Contains(action, body, "GetStreamUri")) return RespGetStreamUri(ctx, rtspPort, body);
       else if (Contains(action, body, "GetSnapshotUri")) return RespGetSnapshotUri(ctx, httpPort);
       else
       {
@@ -189,13 +314,13 @@ namespace V380Decoder.src
                 </tds:Scopes>
               </tds:GetScopesResponse>");
 
-    private static string RespGetVideoSources() => Envelope(@"
+    private static string RespGetVideoSources(V380Client camera) => Envelope($@"
               <trt:GetVideoSourcesResponse>
                 <trt:VideoSources token=""VideoSource_1"">
                   <tt:Framerate>25</tt:Framerate>
                   <tt:Resolution>
-                    <tt:Width>1280</tt:Width>
-                    <tt:Height>720</tt:Height>
+                    <tt:Width>{MainSize(camera).w}</tt:Width>
+                    <tt:Height>{MainSize(camera).h}</tt:Height>
                   </tt:Resolution>
                   <tt:Imaging>
                     <tt:Brightness>50</tt:Brightness>
@@ -252,137 +377,13 @@ namespace V380Decoder.src
               </tds:GetCapabilitiesResponse>");
     }
 
-    private static string RespGetProfiles() => Envelope($@"
-              <trt:GetProfilesResponse>
-                <trt:Profiles token=""Profile_1"" fixed=""true"">
-                  <tt:Name>V380 Live</tt:Name>
-                  <tt:VideoSourceConfiguration token=""VideoSrcCfg_1"">
-                    <tt:Name>VideoSource</tt:Name>
-                    <tt:UseCount>1</tt:UseCount>
-                    <tt:SourceToken>VideoSource_1</tt:SourceToken>
-                    <tt:Bounds x=""0"" y=""0"" width=""1280"" height=""720""/>
-                  </tt:VideoSourceConfiguration>
-                  <tt:VideoEncoderConfiguration token=""VideoEnc_1"">
-                    <tt:Name>H264</tt:Name>
-                    <tt:UseCount>1</tt:UseCount>
-                    <tt:Encoding>H264</tt:Encoding>
-                    <tt:Resolution><tt:Width>1280</tt:Width><tt:Height>720</tt:Height></tt:Resolution>
-                    <tt:RateControl>
-                      <tt:FrameRateLimit>25</tt:FrameRateLimit>
-                      <tt:EncodingInterval>1</tt:EncodingInterval>
-                      <tt:BitrateLimit>4096</tt:BitrateLimit>
-                    </tt:RateControl>
-                    <tt:H264>
-                      <tt:GovLength>30</tt:GovLength>
-                      <tt:H264Profile>High</tt:H264Profile>
-                    </tt:H264>
-                    <tt:Multicast>
-                      <tt:Address><tt:Type>IPv4</tt:Type><tt:IPv4Address>0.0.0.0</tt:IPv4Address></tt:Address>
-                      <tt:Port>0</tt:Port><tt:TTL>0</tt:TTL><tt:AutoStart>false</tt:AutoStart>
-                    </tt:Multicast>
-                    <tt:SessionTimeout>PT60S</tt:SessionTimeout>
-                  </tt:VideoEncoderConfiguration>
-                  <tt:AudioSourceConfiguration token=""AudioSrcCfg_1"">
-                    <tt:Name>AudioSource</tt:Name>
-                    <tt:UseCount>1</tt:UseCount>
-                    <tt:SourceToken>AudioSource_1</tt:SourceToken>
-                  </tt:AudioSourceConfiguration>
-                  <tt:AudioEncoderConfiguration token=""AudioEnc_1"">
-                    <tt:Name>PCMA</tt:Name>
-                    <tt:UseCount>1</tt:UseCount>
-                    <tt:Encoding>G711</tt:Encoding>
-                    <tt:Bitrate>64</tt:Bitrate>
-                    <tt:SampleRate>8</tt:SampleRate>
-                    <tt:Multicast>
-                      <tt:Address><tt:Type>IPv4</tt:Type><tt:IPv4Address>0.0.0.0</tt:IPv4Address></tt:Address>
-                      <tt:Port>0</tt:Port><tt:TTL>0</tt:TTL><tt:AutoStart>false</tt:AutoStart>
-                    </tt:Multicast>
-                    <tt:SessionTimeout>PT60S</tt:SessionTimeout>
-                  </tt:AudioEncoderConfiguration>
-                  <tt:PTZConfiguration token=""PTZConfig_1"">
-                    <tt:Name>PTZ</tt:Name>
-                    <tt:UseCount>1</tt:UseCount>
-                    <tt:NodeToken>PTZNode_1</tt:NodeToken>
-                    <tt:DefaultContinuousPanTiltVelocitySpace>
-                      http://www.onvif.org/ver10/tptz/PanTiltSpaces/VelocityGenericSpace
-                    </tt:DefaultContinuousPanTiltVelocitySpace>
-                    <tt:DefaultPTZTimeout>PT1S</tt:DefaultPTZTimeout>
-                    <tt:PanTiltLimits>
-                      <tt:Range>
-                        <tt:URI>http://www.onvif.org/ver10/tptz/PanTiltSpaces/VelocityGenericSpace</tt:URI>
-                        <tt:XRange><tt:Min>-1</tt:Min><tt:Max>1</tt:Max></tt:XRange>
-                        <tt:YRange><tt:Min>-1</tt:Min><tt:Max>1</tt:Max></tt:YRange>
-                      </tt:Range>
-                    </tt:PanTiltLimits>
-                  </tt:PTZConfiguration>
-                </trt:Profiles>
+    private static string RespGetProfiles(V380Client camera) => Envelope($@"
+              <trt:GetProfilesResponse>{ProfileXml("Profiles", false, camera)}{(HasSub ? ProfileXml("Profiles", true, camera) : "")}
               </trt:GetProfilesResponse>");
 
     // GetProfile (singular) — ODM calls this with a ProfileToken, expects Profile (not Profiles)
-    private static string RespGetProfile() => Envelope($@"
-              <trt:GetProfileResponse>
-                <trt:Profile token=""Profile_1"" fixed=""true"">
-                  <tt:Name>V380 Live</tt:Name>
-                  <tt:VideoSourceConfiguration token=""VideoSrcCfg_1"">
-                    <tt:Name>VideoSource</tt:Name>
-                    <tt:UseCount>1</tt:UseCount>
-                    <tt:SourceToken>VideoSource_1</tt:SourceToken>
-                    <tt:Bounds x=""0"" y=""0"" width=""1280"" height=""720""/>
-                  </tt:VideoSourceConfiguration>
-                  <tt:VideoEncoderConfiguration token=""VideoEnc_1"">
-                    <tt:Name>H264</tt:Name>
-                    <tt:UseCount>1</tt:UseCount>
-                    <tt:Encoding>H264</tt:Encoding>
-                    <tt:Resolution><tt:Width>1280</tt:Width><tt:Height>720</tt:Height></tt:Resolution>
-                    <tt:RateControl>
-                      <tt:FrameRateLimit>25</tt:FrameRateLimit>
-                      <tt:EncodingInterval>1</tt:EncodingInterval>
-                      <tt:BitrateLimit>4096</tt:BitrateLimit>
-                    </tt:RateControl>
-                    <tt:H264>
-                      <tt:GovLength>30</tt:GovLength>
-                      <tt:H264Profile>High</tt:H264Profile>
-                    </tt:H264>
-                    <tt:Multicast>
-                      <tt:Address><tt:Type>IPv4</tt:Type><tt:IPv4Address>0.0.0.0</tt:IPv4Address></tt:Address>
-                      <tt:Port>0</tt:Port><tt:TTL>0</tt:TTL><tt:AutoStart>false</tt:AutoStart>
-                    </tt:Multicast>
-                    <tt:SessionTimeout>PT60S</tt:SessionTimeout>
-                  </tt:VideoEncoderConfiguration>
-                  <tt:AudioSourceConfiguration token=""AudioSrcCfg_1"">
-                    <tt:Name>AudioSource</tt:Name>
-                    <tt:UseCount>1</tt:UseCount>
-                    <tt:SourceToken>AudioSource_1</tt:SourceToken>
-                  </tt:AudioSourceConfiguration>
-                  <tt:AudioEncoderConfiguration token=""AudioEnc_1"">
-                    <tt:Name>PCMA</tt:Name>
-                    <tt:UseCount>1</tt:UseCount>
-                    <tt:Encoding>G711</tt:Encoding>
-                    <tt:Bitrate>64</tt:Bitrate>
-                    <tt:SampleRate>8</tt:SampleRate>
-                    <tt:Multicast>
-                      <tt:Address><tt:Type>IPv4</tt:Type><tt:IPv4Address>0.0.0.0</tt:IPv4Address></tt:Address>
-                      <tt:Port>0</tt:Port><tt:TTL>0</tt:TTL><tt:AutoStart>false</tt:AutoStart>
-                    </tt:Multicast>
-                    <tt:SessionTimeout>PT60S</tt:SessionTimeout>
-                  </tt:AudioEncoderConfiguration>
-                  <tt:PTZConfiguration token=""PTZConfig_1"">
-                    <tt:Name>PTZ</tt:Name>
-                    <tt:UseCount>1</tt:UseCount>
-                    <tt:NodeToken>PTZNode_1</tt:NodeToken>
-                    <tt:DefaultContinuousPanTiltVelocitySpace>
-                      http://www.onvif.org/ver10/tptz/PanTiltSpaces/VelocityGenericSpace
-                    </tt:DefaultContinuousPanTiltVelocitySpace>
-                    <tt:DefaultPTZTimeout>PT1S</tt:DefaultPTZTimeout>
-                    <tt:PanTiltLimits>
-                      <tt:Range>
-                        <tt:URI>http://www.onvif.org/ver10/tptz/PanTiltSpaces/VelocityGenericSpace</tt:URI>
-                        <tt:XRange><tt:Min>-1</tt:Min><tt:Max>1</tt:Max></tt:XRange>
-                        <tt:YRange><tt:Min>-1</tt:Min><tt:Max>1</tt:Max></tt:YRange>
-                      </tt:Range>
-                    </tt:PanTiltLimits>
-                  </tt:PTZConfiguration>
-                </trt:Profile>
+    private static string RespGetProfile(string body, V380Client camera) => Envelope($@"
+              <trt:GetProfileResponse>{ProfileXml("Profile", IsSubProfile(ReqValue(body, "ProfileToken")), camera)}
               </trt:GetProfileResponse>");
 
     private static string RespServiceCapabilities() => Envelope(@"
@@ -452,13 +453,14 @@ namespace V380Decoder.src
                 </timg:ImagingSettings>
               </timg:GetImagingSettingsResponse>");
 
-    private static string RespGetStreamUri(HttpContext ctx, int rtspPort)
+    private static string RespGetStreamUri(HttpContext ctx, int rtspPort, string body)
     {
       string host = ctx.Request.Host.Host.ToString();
+      int port = IsSubProfile(ReqValue(body, "ProfileToken")) ? SubRtspPort : rtspPort;
       return Envelope($@"
               <trt:GetStreamUriResponse>
                 <trt:MediaUri>
-                  <tt:Uri>rtsp://{host}:{rtspPort}/live</tt:Uri>
+                  <tt:Uri>rtsp://{host}:{port}/live</tt:Uri>
                   <tt:InvalidAfterConnect>false</tt:InvalidAfterConnect>
                   <tt:InvalidAfterReboot>false</tt:InvalidAfterReboot>
                   <tt:Timeout>PT0S</tt:Timeout>
@@ -487,13 +489,13 @@ namespace V380Decoder.src
                 </trt:AudioSources>
               </trt:GetAudioSourcesResponse>");
 
-    private static string RespGetVideoSourceConfig() => Envelope(@"
+    private static string RespGetVideoSourceConfig(V380Client camera) => Envelope($@"
               <trt:GetVideoSourceConfigurationResponse>
                 <trt:VideoSourceConfiguration token=""VideoSrcCfg_1"">
                   <tt:Name>VideoSource</tt:Name>
                   <tt:UseCount>1</tt:UseCount>
                   <tt:SourceToken>VideoSource_1</tt:SourceToken>
-                  <tt:Bounds x=""0"" y=""0"" width=""1280"" height=""720""/>
+                  <tt:Bounds x=""0"" y=""0"" width=""{MainSize(camera).w}"" height=""{MainSize(camera).h}""/>
                 </trt:VideoSourceConfiguration>
               </trt:GetVideoSourceConfigurationResponse>");
 
@@ -592,48 +594,22 @@ namespace V380Decoder.src
                 </timg:ImagingOptions>
               </timg:GetOptionsResponse>");
 
-    private static string RespGetVideoSourceConfigurations() => Envelope(@"
+    private static string RespGetVideoSourceConfigurations(V380Client camera) => Envelope($@"
               <trt:GetVideoSourceConfigurationsResponse>
                 <trt:Configurations token=""VideoSrcCfg_1"">
                   <tt:Name>VideoSource</tt:Name>
                   <tt:UseCount>1</tt:UseCount>
                   <tt:SourceToken>VideoSource_1</tt:SourceToken>
-                  <tt:Bounds x=""0"" y=""0"" width=""1280"" height=""720""/>
+                  <tt:Bounds x=""0"" y=""0"" width=""{MainSize(camera).w}"" height=""{MainSize(camera).h}""/>
                 </trt:Configurations>
               </trt:GetVideoSourceConfigurationsResponse>");
 
-    private static string RespGetVideoEncoderConfigurations() => Envelope(@"
-              <trt:GetVideoEncoderConfigurationsResponse>
-                <trt:Configurations token=""VideoEnc_1"">
-                  <tt:Name>H264</tt:Name>
-                  <tt:UseCount>1</tt:UseCount>
-                  <tt:Encoding>H264</tt:Encoding>
-                  <tt:Resolution><tt:Width>1280</tt:Width><tt:Height>720</tt:Height></tt:Resolution>
-                  <tt:RateControl>
-                    <tt:FrameRateLimit>25</tt:FrameRateLimit>
-                    <tt:EncodingInterval>1</tt:EncodingInterval>
-                    <tt:BitrateLimit>4096</tt:BitrateLimit>
-                  </tt:RateControl>
-                  <tt:H264><tt:GovLength>30</tt:GovLength><tt:H264Profile>High</tt:H264Profile></tt:H264>
-                  <tt:SessionTimeout>PT60S</tt:SessionTimeout>
-                </trt:Configurations>
+    private static string RespGetVideoEncoderConfigurations(V380Client camera) => Envelope($@"
+              <trt:GetVideoEncoderConfigurationsResponse>{EncoderXml("Configurations", false, camera)}{(HasSub ? EncoderXml("Configurations", true, camera) : "")}
               </trt:GetVideoEncoderConfigurationsResponse>");
 
-    private static string RespGetVideoEncoderConfig() => Envelope(@"
-              <trt:GetVideoEncoderConfigurationResponse>
-                <trt:Configuration token=""VideoEnc_1"">
-                  <tt:Name>H264</tt:Name>
-                  <tt:UseCount>1</tt:UseCount>
-                  <tt:Encoding>H264</tt:Encoding>
-                  <tt:Resolution><tt:Width>1280</tt:Width><tt:Height>720</tt:Height></tt:Resolution>
-                  <tt:RateControl>
-                    <tt:FrameRateLimit>25</tt:FrameRateLimit>
-                    <tt:EncodingInterval>1</tt:EncodingInterval>
-                    <tt:BitrateLimit>4096</tt:BitrateLimit>
-                  </tt:RateControl>
-                  <tt:H264><tt:GovLength>30</tt:GovLength><tt:H264Profile>High</tt:H264Profile></tt:H264>
-                  <tt:SessionTimeout>PT60S</tt:SessionTimeout>
-                </trt:Configuration>
+    private static string RespGetVideoEncoderConfig(string body, V380Client camera) => Envelope($@"
+              <trt:GetVideoEncoderConfigurationResponse>{EncoderXml("Configuration", IsSubEncoder(ReqValue(body, "ConfigurationToken")), camera)}
               </trt:GetVideoEncoderConfigurationResponse>");
 
     private static string RespGetAudioSourceConfigurations() => Envelope(@"

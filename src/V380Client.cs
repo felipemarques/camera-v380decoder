@@ -20,6 +20,11 @@ namespace V380Decoder.src
         private ushort deviceVersion, communicationVersion;
         private int frameWidth = 1280;
         private int frameheight = 720;
+        // Actual resolution from the locked stream's SPS; 0 = not known yet.
+        // Used by ONVIF (GetProfiles...) instead of the hard-coded 1280x720.
+        private volatile int lockedSpsWidth, lockedSpsHeight;
+        public int VideoWidth => lockedSpsWidth > 0 ? lockedSpsWidth : frameWidth;
+        public int VideoHeight => lockedSpsHeight > 0 ? lockedSpsHeight : frameheight;
         private byte[] aesKey = new byte[16];
         private bool needReconnect = false;
 
@@ -671,6 +676,11 @@ namespace V380Decoder.src
                 lockedLayoutMisses = 0;
                 lockedVideoRawTypes.Clear();
                 lockedVideoRawTypes.Add(rawType);
+                if (best.SpsWidth > 0 && best.SpsHeight > 0)
+                {
+                    lockedSpsWidth = best.SpsWidth;
+                    lockedSpsHeight = best.SpsHeight;
+                }
                 Console.Error.WriteLine($"[VIDEO] layout locked: offset={best.Offset} decrypt={best.Decrypted} codec={best.SpsCodec} " +
                                         $"sps={best.SpsWidth}x{best.SpsHeight} leading={best.Leading} (device reported {frameWidth}x{frameheight})");
                 if (best.SpsWidth != frameWidth || best.SpsHeight != frameheight)

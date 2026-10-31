@@ -32,6 +32,8 @@ if (args.Length > 0)
     int rtspPort = ArgParser.GetArg(args, "--rtsp-port", 8554);
     int httpPort = ArgParser.GetArg(args, "--http-port", 8080);
     string rtspCodec = ArgParser.GetArg(args, "--rtsp-codec", "native");
+    int onvifSubPort = ArgParser.GetArg(args, "--onvif-sub-port", 0);
+    string onvifSubSize = ArgParser.GetArg(args, "--onvif-sub-size", "640x720");
     bool debug = ArgParser.GetArg(args, "--debug", false);
 
     if (source.Equals("lan", StringComparison.OrdinalIgnoreCase) && string.IsNullOrEmpty(ip))
@@ -52,6 +54,31 @@ if (args.Length > 0)
     if (debug)
     {
         LogUtils.enableDebug = true;
+    }
+    if (onvifSubPort != 0)
+    {
+        var sz = System.Text.RegularExpressions.Regex.Match(onvifSubSize ?? "", @"^(\d{2,5})x(\d{2,5})$");
+        if (onvifSubPort < 1 || onvifSubPort > 65535 || onvifSubPort == rtspPort)
+        {
+            Console.Error.WriteLine($"--onvif-sub-port invalid: {onvifSubPort} (1-65535, different from --rtsp-port)");
+            return;
+        }
+        if (!sz.Success)
+        {
+            Console.Error.WriteLine($"--onvif-sub-size invalid: '{onvifSubSize}' (expected WIDTHxHEIGHT, e.g. 640x720)");
+            return;
+        }
+        if (enableOnvif)
+        {
+            OnvifHandler.SubRtspPort = onvifSubPort;
+            OnvifHandler.SubWidth = int.Parse(sz.Groups[1].Value);
+            OnvifHandler.SubHeight = int.Parse(sz.Groups[2].Value);
+            Console.Error.WriteLine($"[ONVIF] second profile (Profile_2): rtsp port {onvifSubPort}, {OnvifHandler.SubWidth}x{OnvifHandler.SubHeight}");
+        }
+        else
+        {
+            Console.Error.WriteLine("[ONVIF] --onvif-sub-port ignored: ONVIF is not enabled");
+        }
     }
 
     OutputMode outputMode = output switch
@@ -215,6 +242,11 @@ SERVER OPTIONS:
   --enable-onvif         Enable ONVIF server (experimental) (default: false)
                          Works only with --output rtsp
                          Tested with Onvif Device Manager (ODM)
+
+  --onvif-sub-port <n>   Announce a second ONVIF profile (Profile_2) whose stream is
+                         rtsp://<host>:<n>/live, e.g. a second V380Decoder started
+                         with --quality sd. 0 = single profile (default: 0)
+  --onvif-sub-size <WxH> Resolution announced for Profile_2 (default: 640x720)
 
 OTHER OPTIONS:
   --discover             Find camera devices on the local network
