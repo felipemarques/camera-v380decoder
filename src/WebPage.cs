@@ -48,8 +48,8 @@ namespace V380Decoder.src
 
                     .live-frame {
                         width: 100%;
-                        aspect-ratio: 16 / 9;
-                        object-fit: cover;
+                        height: auto; max-height: 85vh;
+                        object-fit: contain;
                         border-radius: 14px;
                         background: #0f172a;
                         display: block;
