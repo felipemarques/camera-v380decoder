@@ -23,6 +23,20 @@ namespace V380Decoder.src
         private byte[] aesKey = new byte[16];
         private bool needReconnect = false;
 
+        // ---- Video layout auto-detection -------------------------------------------------
+        // Different V380 models put the media payload at different offsets inside the
+        // reassembled frame, and the AES grid is anchored on the payload start. A misaligned
+        // grid can still yield a valid-looking first NAL (16-byte aligned shift), so the layout
+        // is only trusted once a parameter set (SPS) parses as a coherent H.264/H.265 SPS.
+        // The validated layout (offset, decrypt, codec) is then locked for the session.
+        private static readonly int[] VideoOffsetCandidates = { 0, 4, 8, 12, 16, 20 };
+        private const int LayoutMissesBeforeRelock = 8;
+        private int lockedVideoOffset = -1;
+        private bool lockedVideoDecrypt;
+        private VideoCodec lockedVideoCodec = VideoCodec.Unknown;
+        private int lockedLayoutMisses;
+        private readonly HashSet<byte> lockedVideoRawTypes = new();
+
         public V380Client(string ip, int port, uint deviceId, string username, string password, SourceStream source, OutputMode mode, int streamQuality)
         {
             this.ip = ip;
@@ -309,6 +323,7 @@ namespace V380Decoder.src
         public void ReceiveFrames(OutputMode mode, RtspServer rtsp, CancellationToken ct)
         {
             bool needDecrypt = deviceVersion > 30;
+            ResetVideoLayout("stream start");
 
             var frameFrags = new List<byte>();
             ushort frameTotal = 0;
@@ -337,6 +352,7 @@ namespace V380Decoder.src
                         if (!StreamLogin()) break;
                         if (!StartStream()) break;
                         needReconnect = false;
+                        ResetVideoLayout("reconnect");
                     }
 
                     // 12-byte fragment header
@@ -488,13 +504,13 @@ namespace V380Decoder.src
                 return true;
             }
 
-            if (!TryExtractVideoPayload(full, needDecrypt, out var normalizedPayload))
+            if (!TryExtractVideoPayload(rawType, full, needDecrypt, out var normalizedPayload, out var videoCodec))
             {
                 LogUtils.debug($"[FRAME] unclassified type=0x{rawType:X2} len={full.Length} head={BitConverter.ToString(full, 0, Math.Min(16, full.Length))}");
                 return false;
             }
 
-            bool isKeyFrame = IsKeyVideoFrame(rawType, outerFrameType, normalizedPayload);
+            bool isKeyFrame = IsKeyVideoFrame(rawType, outerFrameType, normalizedPayload, videoCodec);
 
             if (mode == OutputMode.Rtsp)
             {
@@ -508,7 +524,7 @@ namespace V380Decoder.src
                 FrameType = outerFrameType,
                 FrameRate = outerFrameRate,
                 Timestamp = outerTimestamp,
-                Codec = DetectVideoCodec(normalizedPayload),
+                Codec = videoCodec,
                 Payload = normalizedPayload
             };
 
@@ -550,60 +566,150 @@ namespace V380Decoder.src
             return payload;
         }
 
-        private bool TryExtractVideoPayload(byte[] full, bool needDecrypt, out byte[] normalizedPayload)
+        // =====================================================================================
+        // Video payload extraction with layout auto-detection
+        // =====================================================================================
+
+        private enum SpsState { Invalid = 0, Absent = 1, Valid = 2 }
+
+        private sealed class VideoCandidate
         {
-            int bestScore = int.MinValue;
-            byte[] bestPayload = null;
-
-            foreach (var payload in EnumerateVideoCandidates(full, needDecrypt))
-            {
-                if (!TryNormalizeVideoPayload(payload, out var candidate))
-                    continue;
-
-                int score = ScoreVideoPayload(candidate);
-                if (score > bestScore)
-                {
-                    bestScore = score;
-                    bestPayload = candidate;
-                }
-            }
-
-            if (bestPayload != null)
-            {
-                normalizedPayload = bestPayload;
-                return true;
-            }
-
-            normalizedPayload = Array.Empty<byte>();
-            return false;
+            public int Offset;
+            public bool Decrypted;
+            public byte[] Payload;
+            public int Leading;          // bytes skipped before the first start code
+            public int Score;            // legacy NAL heuristic score
+            public SpsState Sps;
+            public VideoCodec SpsCodec = VideoCodec.Unknown;
+            public int SpsWidth, SpsHeight;
+            public int Order;            // enumeration order, last tie-breaker
         }
 
-        private IEnumerable<byte[]> EnumerateVideoCandidates(byte[] full, bool needDecrypt)
+        private void ResetVideoLayout(string reason)
         {
-            foreach (int offset in new[] { 0, 4, 8, 12, 16, 20 })
+            if (lockedVideoOffset >= 0)
+                Console.Error.WriteLine($"[VIDEO] layout unlocked ({reason})");
+            lockedVideoOffset = -1;
+            lockedVideoDecrypt = false;
+            lockedVideoCodec = VideoCodec.Unknown;
+            lockedLayoutMisses = 0;
+            lockedVideoRawTypes.Clear();
+        }
+
+        private bool TryExtractVideoPayload(byte rawType, byte[] full, bool needDecrypt, out byte[] normalizedPayload, out VideoCodec codec)
+        {
+            // 1) Fast path: layout already validated on this session.
+            if (lockedVideoOffset >= 0)
+            {
+                if (full.Length > lockedVideoOffset)
+                {
+                    byte[] p = BuildVideoCandidate(full, lockedVideoOffset, lockedVideoDecrypt);
+                    if (TryNormalizeVideoPayload(p, out var cand, out _) &&
+                        IsPlausibleNalHeader(cand, NalHeaderIndex(cand), lockedVideoCodec))
+                    {
+                        lockedLayoutMisses = 0;
+                        lockedVideoRawTypes.Add(rawType);
+                        normalizedPayload = cand;
+                        codec = lockedVideoCodec;
+                        return true;
+                    }
+                }
+
+                // Frame types that never carried video under this layout (metadata such as 0x18)
+                // are simply not video: they must not trigger a re-detection.
+                if (lockedVideoRawTypes.Contains(rawType) && ++lockedLayoutMisses >= LayoutMissesBeforeRelock)
+                {
+                    Console.Error.WriteLine($"[VIDEO] {lockedLayoutMisses} consecutive frames do not match the locked layout");
+                    ResetVideoLayout("layout mismatch");
+                }
+
+                normalizedPayload = Array.Empty<byte>();
+                codec = VideoCodec.Unknown;
+                return false;
+            }
+
+            // 2) Detection: evaluate every (offset, decrypt) hypothesis.
+            VideoCandidate best = null;
+            int order = 0;
+            foreach (int offset in VideoOffsetCandidates)
             {
                 if (full.Length <= offset) continue;
 
-                byte[] direct = new byte[full.Length - offset];
-                Array.Copy(full, offset, direct, 0, direct.Length);
-
-                if (needDecrypt && direct.Length >= 16)
+                var modes = (needDecrypt && full.Length - offset >= 16) ? new[] { true, false } : new[] { false };
+                foreach (bool decrypt in modes)
                 {
-                    byte[] decrypted = (byte[])direct.Clone();
-                    if (communicationVersion == 21)
-                        DecryptMediaPre2k(decrypted, decrypted.Length, 1);
-                    else
-                        DecryptVideoFrame(decrypted, decrypted.Length);
-                    yield return decrypted;
-                }
+                    byte[] payload = BuildVideoCandidate(full, offset, decrypt);
+                    if (!TryNormalizeVideoPayload(payload, out var normalized, out int leading))
+                        continue;
 
-                yield return direct;
+                    int score = ScoreVideoPayload(normalized);
+                    if (score == int.MinValue) continue;
+
+                    var c = new VideoCandidate
+                    {
+                        Offset = offset, Decrypted = decrypt, Payload = normalized,
+                        Leading = leading, Score = score, Order = order++
+                    };
+                    AnalyzeParameterSets(c);
+
+                    if (best == null || IsBetterCandidate(c, best)) best = c;
+                }
             }
+
+            if (best == null)
+            {
+                normalizedPayload = Array.Empty<byte>();
+                codec = VideoCodec.Unknown;
+                return false;
+            }
+
+            if (best.Sps == SpsState.Valid)
+            {
+                lockedVideoOffset = best.Offset;
+                lockedVideoDecrypt = best.Decrypted;
+                lockedVideoCodec = best.SpsCodec;
+                lockedLayoutMisses = 0;
+                lockedVideoRawTypes.Clear();
+                lockedVideoRawTypes.Add(rawType);
+                Console.Error.WriteLine($"[VIDEO] layout locked: offset={best.Offset} decrypt={best.Decrypted} codec={best.SpsCodec} " +
+                                        $"sps={best.SpsWidth}x{best.SpsHeight} leading={best.Leading} (device reported {frameWidth}x{frameheight})");
+                if (best.SpsWidth != frameWidth || best.SpsHeight != frameheight)
+                    Console.Error.WriteLine($"[VIDEO] note: SPS size differs from the size reported at login");
+            }
+
+            normalizedPayload = best.Payload;
+            codec = best.Sps == SpsState.Valid ? best.SpsCodec : DetectVideoCodec(best.Payload);
+            return true;
         }
 
-        private bool TryNormalizeVideoPayload(byte[] payload, out byte[] normalizedPayload)
+        // Ranking: a coherent SPS beats everything, then a payload starting exactly on a start
+        // code (the AES grid is anchored on the payload start), then the legacy NAL score.
+        private static bool IsBetterCandidate(VideoCandidate c, VideoCandidate best)
+        {
+            if (c.Sps != best.Sps) return c.Sps > best.Sps;
+            if (c.Leading != best.Leading) return c.Leading < best.Leading;
+            if (c.Score != best.Score) return c.Score > best.Score;
+            return c.Order < best.Order;
+        }
+
+        private byte[] BuildVideoCandidate(byte[] full, int offset, bool decrypt)
+        {
+            byte[] data = new byte[full.Length - offset];
+            Array.Copy(full, offset, data, 0, data.Length);
+            if (decrypt && data.Length >= 16)
+            {
+                if (communicationVersion == 21)
+                    DecryptMediaPre2k(data, data.Length, 1);
+                else
+                    DecryptVideoFrame(data, data.Length);
+            }
+            return data;
+        }
+
+        private bool TryNormalizeVideoPayload(byte[] payload, out byte[] normalizedPayload, out int leading)
         {
             int start = FindVideoStartCode(payload);
+            leading = start;
             if (start < 0)
             {
                 normalizedPayload = payload;
@@ -623,20 +729,84 @@ namespace V380Decoder.src
             return true;
         }
 
-        private bool IsKeyVideoFrame(byte rawType, ushort frameType, byte[] payload)
+        private static int NalHeaderIndex(byte[] payload)
+            => payload.Length >= 4 && payload[2] == 0 && payload[3] == 1 ? 4 : 3;
+
+        // Header check for a known codec (stricter than IsLikelyNalHeader).
+        private static bool IsPlausibleNalHeader(byte[] p, int i, VideoCodec codec)
+        {
+            if (i >= p.Length) return false;
+            if ((p[i] & 0x80) != 0) return false;                 // forbidden_zero_bit
+            if (codec == VideoCodec.H265)
+            {
+                if (i + 1 >= p.Length) return false;
+                int type = (p[i] >> 1) & 0x3F;
+                int layerId = ((p[i] & 1) << 5) | (p[i + 1] >> 3);
+                int tid = p[i + 1] & 7;
+                return type <= 40 && layerId == 0 && tid >= 1;
+            }
+            if (codec == VideoCodec.H264)
+            {
+                int type = p[i] & 0x1F;
+                return type is >= 1 and <= 23;
+            }
+            return false;
+        }
+
+        private void AnalyzeParameterSets(VideoCandidate c)
+        {
+            c.Sps = SpsState.Absent;
+            byte[] p = c.Payload;
+            int i = 0, nals = 0;
+            while (i < p.Length - 4 && nals < 16)
+            {
+                int sc = FindNextStartCode(p, i);
+                if (sc < 0) break;
+                int nalStart = sc + (p[sc + 2] == 1 ? 3 : 4);
+                if (nalStart >= p.Length) break;
+                int next = FindNextStartCode(p, nalStart);
+                int nalEnd = next < 0 ? p.Length : next;
+                nals++;
+
+                byte h = p[nalStart];
+                bool h265Sps = (h & 0x81) == 0 && ((h >> 1) & 0x3F) == 33;
+                bool h264Sps = (h & 0x80) == 0 && (h & 0x1F) == 7;
+                if (h265Sps || h264Sps)
+                {
+                    int len = nalEnd - nalStart;
+                    if (h265Sps && TryParseH265Sps(p, nalStart, len, out int w, out int hgt))
+                    {
+                        c.Sps = SpsState.Valid; c.SpsCodec = VideoCodec.H265; c.SpsWidth = w; c.SpsHeight = hgt;
+                        return;
+                    }
+                    if (h264Sps && TryParseH264Sps(p, nalStart, len, out w, out hgt))
+                    {
+                        c.Sps = SpsState.Valid; c.SpsCodec = VideoCodec.H264; c.SpsWidth = w; c.SpsHeight = hgt;
+                        return;
+                    }
+                    c.Sps = SpsState.Invalid;   // an SPS is there but is not coherent: wrong layout
+                }
+                i = nalEnd;
+            }
+        }
+
+        private bool IsKeyVideoFrame(byte rawType, ushort frameType, byte[] payload, VideoCodec codec)
         {
             if (rawType == 0x00) return true;
 
-            int nalOffset = payload.Length >= 4 && payload[2] == 0 && payload[3] == 1 ? 4 : 3;
+            int nalOffset = NalHeaderIndex(payload);
             if (payload.Length <= nalOffset) return false;
-
             byte nalHeader = payload[nalOffset];
+
+            if (codec == VideoCodec.H265)
+                return ((nalHeader >> 1) & 0x3F) is >= 16 and <= 21 or 32 or 33 or 34 || frameType == 0;
+            if (codec == VideoCodec.H264)
+                return (nalHeader & 0x1F) is 5 or 7 or 8 || frameType == 0;
+
             int h264NalType = nalHeader & 0x1F;
             if (h264NalType == 5 || h264NalType == 7 || h264NalType == 8) return true;
-
             int h265NalType = (nalHeader >> 1) & 0x3F;
             if (h265NalType is 19 or 20 or 32 or 33 or 34) return true;
-
             return frameType == 0;
         }
 
@@ -737,23 +907,164 @@ namespace V380Decoder.src
             return h265NalType is > 0 and < 48;
         }
 
+        // Heuristic, used only until an SPS has been validated. The H.265 header is checked
+        // first with its 2-byte constraints (layer id 0, temporal id >= 1): checking H.264
+        // first misclassifies H.265 slices such as 0x02 01 (TRAIL_R) or 0x26 01 (IDR) as H.264.
         private VideoCodec DetectVideoCodec(byte[] payload)
         {
             if (payload == null || payload.Length < 5) return VideoCodec.Unknown;
 
-            int offset = payload[2] == 1 ? 3 : 4;
+            int offset = NalHeaderIndex(payload);
             if (payload.Length <= offset) return VideoCodec.Unknown;
 
-            byte nalHeader = payload[offset];
-            int h264NalType = nalHeader & 0x1F;
-            if (h264NalType is > 0 and < 24)
-                return VideoCodec.H264;
-
-            int h265NalType = (nalHeader >> 1) & 0x3F;
-            if (h265NalType is > 0 and < 48)
-                return VideoCodec.H265;
-
+            if (IsPlausibleNalHeader(payload, offset, VideoCodec.H265)) return VideoCodec.H265;
+            if (IsPlausibleNalHeader(payload, offset, VideoCodec.H264)) return VideoCodec.H264;
             return VideoCodec.Unknown;
+        }
+
+        // ---- SPS parsers (validation + picture size) ----------------------------------------
+
+        private sealed class BitReader
+        {
+            private readonly byte[] d; private int pos; private readonly int bits;
+            public BitReader(byte[] data) { d = data; bits = data.Length * 8; }
+            public int Read(int n)
+            {
+                int v = 0;
+                for (int k = 0; k < n; k++)
+                {
+                    if (pos >= bits) throw new EndOfStreamException();
+                    v = (v << 1) | ((d[pos >> 3] >> (7 - (pos & 7))) & 1);
+                    pos++;
+                }
+                return v;
+            }
+            public void Skip(int n) { if (pos + n > bits) throw new EndOfStreamException(); pos += n; }
+            public uint Ue()
+            {
+                int zeros = 0;
+                while (Read(1) == 0) { if (++zeros > 31) throw new InvalidDataException(); }
+                return zeros == 0 ? 0u : (uint)((1L << zeros) - 1 + Read(zeros));
+            }
+            public int Se() { uint k = Ue(); return (k & 1) != 0 ? (int)((k + 1) / 2) : -(int)(k / 2); }
+        }
+
+        // Removes emulation-prevention bytes (00 00 03 -> 00 00), limited to the SPS head.
+        private static byte[] ToRbsp(byte[] p, int start, int len, int max = 512)
+        {
+            int end = start + Math.Min(len, max);
+            var o = new List<byte>(end - start);
+            int zeros = 0;
+            for (int i = start; i < end; i++)
+            {
+                if (zeros >= 2 && p[i] == 3) { zeros = 0; continue; }
+                o.Add(p[i]);
+                zeros = p[i] == 0 ? zeros + 1 : 0;
+            }
+            return o.ToArray();
+        }
+
+        private static bool TryParseH265Sps(byte[] p, int nalStart, int len, out int width, out int height)
+        {
+            width = height = 0;
+            if (len < 6) return false;
+            if ((p[nalStart] & 0x81) != 0 || ((p[nalStart] >> 1) & 0x3F) != 33) return false;
+            if ((p[nalStart + 1] >> 3) != 0 || (p[nalStart + 1] & 7) == 0) return false;
+            try
+            {
+                var br = new BitReader(ToRbsp(p, nalStart + 2, len - 2));
+                br.Skip(4);                                   // sps_video_parameter_set_id
+                int maxSub = br.Read(3); if (maxSub > 6) return false;
+                br.Skip(1);                                   // temporal_id_nesting
+                if (br.Read(2) != 0) return false;            // general_profile_space
+                br.Skip(1);                                   // tier
+                if (br.Read(5) > 11) return false;            // general_profile_idc
+                br.Skip(32 + 4 + 43 + 1);                     // compat flags, constraint flags
+                br.Skip(8);                                   // general_level_idc
+                var subProf = new bool[maxSub]; var subLvl = new bool[maxSub];
+                for (int i = 0; i < maxSub; i++) { subProf[i] = br.Read(1) == 1; subLvl[i] = br.Read(1) == 1; }
+                if (maxSub > 0) for (int i = maxSub; i < 8; i++) br.Skip(2);
+                for (int i = 0; i < maxSub; i++) { if (subProf[i]) br.Skip(88); if (subLvl[i]) br.Skip(8); }
+                if (br.Ue() > 15) return false;               // sps_seq_parameter_set_id
+                uint chroma = br.Ue(); if (chroma > 3) return false;
+                if (chroma == 3) br.Skip(1);
+                uint w = br.Ue(), h = br.Ue();
+                if (w == 0 || h == 0 || w > 16384 || h > 16384 || (w & 7) != 0 || (h & 7) != 0) return false;
+                uint cl = 0, cr = 0, ct = 0, cb = 0;
+                if (br.Read(1) == 1) { cl = br.Ue(); cr = br.Ue(); ct = br.Ue(); cb = br.Ue(); }
+                if (br.Ue() > 8 || br.Ue() > 8) return false; // bit depths
+                if (br.Ue() > 12) return false;               // log2_max_pic_order_cnt_lsb_minus4
+                int subW = chroma is 1 or 2 ? 2 : 1, subH = chroma == 1 ? 2 : 1;
+                long ww = w - (long)subW * (cl + cr), hh = h - (long)subH * (ct + cb);
+                if (ww <= 0 || hh <= 0) return false;
+                width = (int)ww; height = (int)hh;
+                return true;
+            }
+            catch (Exception) { return false; }
+        }
+
+        private static bool TryParseH264Sps(byte[] p, int nalStart, int len, out int width, out int height)
+        {
+            width = height = 0;
+            if (len < 5) return false;
+            if ((p[nalStart] & 0x80) != 0 || (p[nalStart] & 0x1F) != 7 || (p[nalStart] & 0x60) == 0) return false;
+            try
+            {
+                var br = new BitReader(ToRbsp(p, nalStart + 1, len - 1));
+                int profile = br.Read(8);
+                if (profile is not (66 or 77 or 88 or 100 or 110 or 122 or 244 or 44 or 83 or 86 or 118 or 128 or 138 or 139 or 134 or 135))
+                    return false;
+                br.Skip(8);                                   // constraint flags
+                int level = br.Read(8); if (level == 0 || level > 62) return false;
+                if (br.Ue() > 31) return false;               // seq_parameter_set_id
+                uint chroma = 1;
+                if (profile is 100 or 110 or 122 or 244 or 44 or 83 or 86 or 118 or 128 or 138 or 139 or 134 or 135)
+                {
+                    chroma = br.Ue(); if (chroma > 3) return false;
+                    if (chroma == 3) br.Skip(1);
+                    if (br.Ue() > 6 || br.Ue() > 6) return false;
+                    br.Skip(1);                               // qpprime_y_zero_transform_bypass
+                    if (br.Read(1) == 1)                      // seq_scaling_matrix_present
+                    {
+                        int lists = chroma != 3 ? 8 : 12;
+                        for (int i = 0; i < lists; i++)
+                        {
+                            if (br.Read(1) == 0) continue;
+                            int size = i < 6 ? 16 : 64, last = 8, next = 8;
+                            for (int j = 0; j < size; j++)
+                            {
+                                if (next != 0) next = (last + br.Se() + 256) % 256;
+                                last = next == 0 ? last : next;
+                            }
+                        }
+                    }
+                }
+                if (br.Ue() > 12) return false;               // log2_max_frame_num_minus4
+                uint pocType = br.Ue(); if (pocType > 2) return false;
+                if (pocType == 0) { if (br.Ue() > 12) return false; }
+                else if (pocType == 1)
+                {
+                    br.Skip(1); br.Se(); br.Se();
+                    uint n = br.Ue(); if (n > 255) return false;
+                    for (int i = 0; i < n; i++) br.Se();
+                }
+                if (br.Ue() > 16) return false;               // max_num_ref_frames
+                br.Skip(1);                                   // gaps_in_frame_num_allowed
+                uint wMbs = br.Ue() + 1, hMap = br.Ue() + 1;
+                int frameMbsOnly = br.Read(1);
+                if (frameMbsOnly == 0) br.Skip(1);
+                br.Skip(1);                                   // direct_8x8_inference
+                uint cl = 0, cr = 0, ct = 0, cb = 0;
+                if (br.Read(1) == 1) { cl = br.Ue(); cr = br.Ue(); ct = br.Ue(); cb = br.Ue(); }
+                long w = wMbs * 16L, h = (2 - frameMbsOnly) * hMap * 16L;
+                if (w > 16384 || h > 16384) return false;
+                int cropX = chroma is 1 or 2 ? 2 : 1, cropY = (chroma == 1 ? 2 : 1) * (2 - frameMbsOnly);
+                w -= cropX * (cl + cr); h -= cropY * (ct + cb);
+                if (w <= 0 || h <= 0) return false;
+                width = (int)w; height = (int)h;
+                return true;
+            }
+            catch (Exception) { return false; }
         }
 
         private void DecryptVideoFrame(byte[] data, int length)
