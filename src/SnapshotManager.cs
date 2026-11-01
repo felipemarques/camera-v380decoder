@@ -1,8 +1,4 @@
 using System.Diagnostics;
-using H264Sharp;
-using SixLabors.ImageSharp;
-using SixLabors.ImageSharp.Formats.Jpeg;
-using SixLabors.ImageSharp.PixelFormats;
 
 namespace V380Decoder.src
 {
@@ -27,8 +23,6 @@ namespace V380Decoder.src
         private bool isDecoding = false;
         private int imageWidth;
         private int imageHeight;
-        private H264Decoder decoder = null;
-        private bool decoderInitialized = false;
         private bool autoDecodeEnabled = true;
         private DateTime lastAutoDecodeTime = DateTime.MinValue;
         private const int MinAutoDecodeIntervalH264Ms = 2000;
@@ -40,6 +34,7 @@ namespace V380Decoder.src
 
         public SnapshotManager()
         {
+            // Snapshots use ffmpeg only (ImageSharp and H264Sharp removed).
             if (IsFFmpegAvailable())
             {
                 LogUtils.debug($"[SNAPSHOT] use FFmpeg decoder");
@@ -47,8 +42,7 @@ namespace V380Decoder.src
             }
             else
             {
-                LogUtils.debug($"[SNAPSHOT] use H264Sharp decoder");
-                decoder = new H264Decoder();
+                Console.Error.WriteLine("[SNAPSHOT] ffmpeg not found: snapshots and MJPEG disabled");
             }
         }
 
@@ -114,11 +108,8 @@ namespace V380Decoder.src
                     if (isDecoding)
                         return;
 
-                    if (codec == VideoCodec.H265 && !useFFmpeg)
-                    {
-                        LogUtils.debug("[SNAPSHOT] H.265 detected but FFmpeg is not available");
+                    if (!useFFmpeg)
                         return;
-                    }
 
                     if (spsNal == null || ppsNal == null)
                     {
@@ -139,13 +130,7 @@ namespace V380Decoder.src
             if (!shouldQueueDecode)
                 return;
 
-            ThreadPool.QueueUserWorkItem(_ =>
-            {
-                if (useFFmpeg)
-                    DecodeWithFFmpeg(decodeFrame);
-                else
-                    DecodeSnapshot(decodeFrame);
-            });
+            ThreadPool.QueueUserWorkItem(_ => DecodeWithFFmpeg(decodeFrame));
         }
 
         private void ExtractSPSandPPS(byte[] h264Data)
@@ -258,11 +243,8 @@ namespace V380Decoder.src
                     return cachedJpeg;
                 }
 
-                if (codec == VideoCodec.H265 && !useFFmpeg)
-                {
-                    LogUtils.debug("[SNAPSHOT] H.265 detected but FFmpeg is not available");
+                if (!useFFmpeg)
                     return cachedJpeg;
-                }
 
                 if (isDecoding)
                     return cachedJpeg;
@@ -276,12 +258,7 @@ namespace V380Decoder.src
             }
 
             if (needDecode)
-            {
-                if (useFFmpeg)
-                    DecodeWithFFmpeg(h264Data);
-                else
-                    DecodeSnapshot(h264Data);
-            }
+                DecodeWithFFmpeg(h264Data);
 
             lock (lockObj)
             {
@@ -330,132 +307,80 @@ namespace V380Decoder.src
             return ms.ToArray();
         }
 
-        private void DecodeSnapshot(byte[] h264Data)
-        {
-            try
-            {
-                LogUtils.debug($"[SNAPSHOT] Decoding {h264Data.Length} bytes");
-                if (!decoderInitialized)
-                {
-                    decoder.Initialize();
-                    decoderInitialized = true;
-                    LogUtils.debug("[SNAPSHOT] Decoder initialized");
-                }
-
-                RgbImage rgbOut = new(ImageFormat.Bgr, imageWidth, imageHeight);
-
-                var decodedFrame = decoder.Decode(
-                    h264Data,
-                    0,
-                    h264Data.Length,
-                    false,
-                    out DecodingState state,
-                    ref rgbOut
-                );
-
-                if (!decodedFrame || state != DecodingState.dsErrorFree)
-                {
-                    LogUtils.debug($"[SNAPSHOT] Decode failed: {state}");
-
-                    if (state == DecodingState.dsInitialOptExpected)
-                    {
-                        LogUtils.debug("[SNAPSHOT] Resetting decoder...");
-                        decoder.Dispose();
-                        decoder = new H264Decoder();
-                        decoder.Initialize();
-                        decoderInitialized = true;
-
-                        // Retry decode
-                        decodedFrame = decoder.Decode(
-                            h264Data, 0, h264Data.Length,
-                            false, out state, ref rgbOut
-                        );
-
-                        if (!decodedFrame)
-                        {
-                            LogUtils.debug($"[SNAPSHOT] Retry failed: {state}");
-                            lock (lockObj) { isDecoding = false; }
-                            return;
-                        }
-                    }
-                    else
-                    {
-                        lock (lockObj) { isDecoding = false; }
-                        return;
-                    }
-                }
-
-                var jpeg = ConvertToJpeg(
-                    rgbOut.GetBytes(),
-                    imageWidth,
-                    imageHeight
-                );
-
-                StoreJpegIfUsable(jpeg);
-                lock (lockObj) { isDecoding = false; }
-
-                autoDecodeEnabled = false;
-                LogUtils.debug($"[SNAPSHOT] Success: {jpeg.Length} bytes JPEG");
-            }
-            catch (Exception ex)
-            {
-                LogUtils.debug($"[SNAPSHOT] Error: {ex.Message}");
-                LogUtils.debug($"[SNAPSHOT] Stack: {ex.StackTrace}");
-                lock (lockObj) { isDecoding = false; }
-            }
-        }
-
-        private byte[] ConvertToJpeg(byte[] rgb, int width, int height)
-        {
-            using var image = Image.LoadPixelData<Rgb24>(rgb, width, height);
-            using var ms = new MemoryStream();
-            image.Save(ms, new JpegEncoder { Quality = 80 });
-            return ms.ToArray();
-        }
+        // One ffmpeg run per snapshot: the JPEG on stdout and, for the
+        // gray-frame test, a raw RGB 32x18 thumbnail (nearest-neighbour scaling)
+        // in a temp file. No image is decoded in-process.
+        private const int ThumbW = 32, ThumbH = 18;
+        private const int FFmpegTimeoutMs = 5000;
 
         private void DecodeWithFFmpeg(byte[] h264Data)
         {
+            string thumbPath = Path.Combine(Path.GetTempPath(), $"v380-thumb-{Environment.ProcessId}-{Guid.NewGuid():N}.rgb");
             try
             {
                 var psi = new ProcessStartInfo
                 {
                     FileName = "ffmpeg",
-                    Arguments = $"-hide_banner -loglevel error -f {(codec == VideoCodec.H265 ? "hevc" : "h264")} -i pipe:0 -frames:v 1 -q:v 2 -f image2 pipe:1",
                     UseShellExecute = false,
                     RedirectStandardInput = true,
                     RedirectStandardOutput = true,
                     CreateNoWindow = true
                 };
+                foreach (var a in new[] {
+                    "-hide_banner", "-loglevel", "error",
+                    "-f", codec == VideoCodec.H265 ? "hevc" : "h264", "-i", "pipe:0",
+                    "-filter_complex", $"[0:v]split=2[j][g];[g]scale={ThumbW}:{ThumbH}:flags=neighbor,format=rgb24[t]",
+                    "-map", "[j]", "-frames:v", "1", "-q:v", "2", "-f", "image2", "pipe:1",
+                    "-map", "[t]", "-frames:v", "1", "-f", "rawvideo", "-y", thumbPath })
+                    psi.ArgumentList.Add(a);
 
                 using var proc = Process.Start(psi);
-                proc.StandardInput.BaseStream.Write(h264Data, 0, h264Data.Length);
-                proc.StandardInput.Close();
+                // Write stdin while reading stdout to avoid a pipe deadlock.
+                var writer = Task.Run(() =>
+                {
+                    try
+                    {
+                        proc.StandardInput.BaseStream.Write(h264Data, 0, h264Data.Length);
+                        proc.StandardInput.Close();
+                    }
+                    catch (IOException) { }
+                });
 
                 using var ms = new MemoryStream();
-                proc.StandardOutput.BaseStream.CopyTo(ms);
-                proc.WaitForExit(2000);
-                if (ms.Length > 0)
+                var reader = proc.StandardOutput.BaseStream.CopyToAsync(ms);
+                bool timedOut = false;
+                if (!reader.Wait(FFmpegTimeoutMs) || !proc.WaitForExit(FFmpegTimeoutMs))
+                {
+                    timedOut = true;
+                    try { proc.Kill(entireProcessTree: true); } catch { }
+                    Console.Error.WriteLine("[SNAPSHOT] ffmpeg timeout: frame ignored");
+                }
+                writer.Wait(1000);
+
+                if (!timedOut && ms.Length > 0)
                 {
                     LogUtils.debug($"[SNAPSHOT] Success: {ms.Length} bytes JPEG");
-                    StoreJpegIfUsable(ms.ToArray());
-                    lock (lockObj) { isDecoding = false; }
-                    return;
+                    byte[] thumb = File.Exists(thumbPath) ? File.ReadAllBytes(thumbPath) : null;
+                    StoreJpegIfUsable(ms.ToArray(), thumb);
                 }
-                lock (lockObj) { isDecoding = false; }
             }
-            catch
+            catch (Exception ex)
             {
-                Console.Error.Write("[SNAPSHOT] FFmpeg not installed");
+                Console.Error.WriteLine($"[SNAPSHOT] ffmpeg error: {ex.Message}");
+            }
+            finally
+            {
+                try { File.Delete(thumbPath); } catch { }
                 lock (lockObj) { isDecoding = false; }
             }
         }
 
-        private void StoreJpegIfUsable(byte[] jpeg)
+        private void StoreJpegIfUsable(byte[] jpeg, byte[] thumbRgb)
         {
             if (jpeg == null || jpeg.Length == 0)
                 return;
 
-            if (IsLikelyGrayFrame(jpeg))
+            if (IsLikelyGrayFrame(thumbRgb))
             {
                 LogUtils.debug("[SNAPSHOT] Ignored low-detail gray frame");
                 return;
@@ -469,50 +394,35 @@ namespace V380Decoder.src
             }
         }
 
-        private bool IsLikelyGrayFrame(byte[] jpeg)
+        // Same thresholds as the former ImageSharp code: almost all gray AND very little detail.
+        // Missing or incomplete thumbnail: frame accepted, as the old code did on error.
+        private static bool IsLikelyGrayFrame(byte[] rgb)
         {
-            try
-            {
-                using var image = Image.Load<Rgb24>(jpeg);
-                int stepX = Math.Max(1, image.Width / 32);
-                int stepY = Math.Max(1, image.Height / 18);
-                int samples = 0;
-                long sum = 0;
-                long sumSq = 0;
-                int nearGray = 0;
-
-                for (int y = 0; y < image.Height; y += stepY)
-                {
-                    for (int x = 0; x < image.Width; x += stepX)
-                    {
-                        var p = image[x, y];
-                        int luminance = (p.R * 77 + p.G * 150 + p.B * 29) >> 8;
-                        sum += luminance;
-                        sumSq += luminance * luminance;
-                        if (Math.Abs(p.R - p.G) < 8 && Math.Abs(p.G - p.B) < 8)
-                            nearGray++;
-                        samples++;
-                    }
-                }
-
-                if (samples == 0)
-                    return false;
-
-                double mean = sum / (double)samples;
-                double variance = (sumSq / (double)samples) - (mean * mean);
-                double grayRatio = nearGray / (double)samples;
-
-                return grayRatio > 0.96 && variance < 180;
-            }
-            catch
-            {
+            if (rgb == null || rgb.Length < ThumbW * ThumbH * 3)
                 return false;
+
+            int samples = 0, nearGray = 0;
+            long sum = 0, sumSq = 0;
+            for (int i = 0; i + 2 < ThumbW * ThumbH * 3; i += 3)
+            {
+                int r = rgb[i], g = rgb[i + 1], b = rgb[i + 2];
+                int luminance = (r * 77 + g * 150 + b * 29) >> 8;
+                sum += luminance;
+                sumSq += luminance * luminance;
+                if (Math.Abs(r - g) < 8 && Math.Abs(g - b) < 8)
+                    nearGray++;
+                samples++;
             }
+
+            double mean = sum / (double)samples;
+            double variance = (sumSq / (double)samples) - (mean * mean);
+            double grayRatio = nearGray / (double)samples;
+
+            return grayRatio > 0.96 && variance < 180;
         }
 
         public void Dispose()
         {
-            decoder?.Dispose();
             lock (lockObj)
             {
                 lastH264Frame = null;
